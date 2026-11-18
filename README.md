@@ -1,73 +1,56 @@
 # Library Catalog Service
 
-This project defines the MongoDB schema for a library catalog and seeds realistic sample data for genres and books.
+A MongoDB-backed library catalog API with bcrypt password hashing, JWT authentication, and librarian-only catalog management.
 
 ## Setup
 
-1. Copy `.env.example` to `.env`.
-2. Update `MONGODB_URI` with your MongoDB connection string.
-3. Install dependencies:
-   ```bash
-   npm install
-   ```
-4. Seed the database:
-   ```bash
-   npm run seed
-   ```
+1. Install Node.js (18+) and MongoDB.
+2. Copy `.env.example` to `.env` and set `MONGODB_URI` and a strong, private `JWT_SECRET` (at least 32 random characters).
+3. Install dependencies: `npm install`.
+4. Seed sample catalog data and the development librarian: `npm run seed`.
+5. Start the API: `npm start`.
 
-## Schema Design
+The API listens on `http://localhost:3000`. Never commit your real `.env` file. The seeded credentials below are for local assignment testing only; change them before any deployment.
 
-### Book fields
+## Seeded librarian (development only)
 
-#### `title`
-- Stored as a plain string field.
-- It belongs directly to the book and is read and displayed together with the rest of the record.
-- Embedding keeps the title with the book record, which is simpler and faster for catalog pages that usually fetch the whole book instead of joining to another collection.
+- Username: `librarian`
+- Email: `librarian@library.local`
+- Password: `LibraryAdmin123!`
 
-#### `author`
-- Stored as a plain string field.
-- The author is a core attribute of the book itself and is not shared as a separate entity in this project.
-- Keeping it embedded avoids an unnecessary `authors` collection and keeps the catalog query simple.
+The seed script hashes this password with bcrypt (12 salt rounds) before saving it. It is idempotent and maintains one librarian account; it does not store a plaintext password. Override the values with the `SEED_LIBRARIAN_*` environment variables. Do not use these public test credentials in production.
 
-#### `isbn`
-- Stored as a plain string field with a unique constraint.
-- It acts as a global identifier for a specific book edition and is most useful for direct lookup.
-- A string is appropriate because ISBNs are formatted identifiers, not object references, and the unique index helps ensure each title edition is distinct.
+## API endpoints
 
-#### `description`
-- Stored as a plain string field.
-- This is descriptive text for the book and is usually fetched alongside the book record.
-- Embedding avoids a separate collection and reduces query complexity for a catalog detail view.
+| Method | Endpoint | Access | Purpose |
+|---|---|---|---|
+| POST | `/api/auth/register` | Public | Create a patron account; clients cannot assign themselves a role |
+| POST | `/api/auth/login` | Public | Verify credentials and set an httpOnly JWT cookie |
+| POST | `/api/auth/logout` | Public | Clear the authentication cookie in the browser |
+| GET | `/api/users/profile` | Authenticated | Return only the caller's own profile |
+| GET | `/api/books` | Public | List catalog books |
+| POST | `/api/books` | Librarian | Create a book |
+| PUT | `/api/books/:id` | Librarian | Update a book |
+| DELETE | `/api/books/:id` | Librarian | Delete a book |
 
-#### `coverImage`
-- Stored as a plain string URL.
-- The image is part of the book's presentation and does not need its own collection or relationship logic.
-- This keeps the data simple while still supporting external image hosting and fast reads.
+### Authorization behavior
 
-#### `totalCopies` and `availableCopies`
-- Stored as numeric fields on the same `Book` document.
-- Inventory is a property of a specific book instance in the library, so it is most natural to keep them with the book.
-- This avoids a separate inventory collection and allows stock checks to happen in one read without joins.
-- Trade-off: the data is duplicated less than it would be in a normalized design, but it means the inventory numbers live inside the book document instead of being split across collections.
+- No token or an invalid/expired token on a protected route returns **401 Unauthorized**.
+- A valid patron token on a librarian-only route returns **403 Forbidden**.
+- A valid librarian token can perform catalog mutations.
+- Registration always creates a `patron`; role assignment is controlled by the seed/admin process.
+- The profile endpoint derives the user identity from the verified JWT subject and never accepts a user ID from the request.
 
-#### `genre`
-- Stored as a MongoDB `ObjectId` reference to a `Genre` document.
-- This is the one field that is intentionally not embedded because many books can share the same genre, such as multiple sci-fi or romance titles.
-- A reference keeps genre data normalized and avoids duplication of repeated strings like "Science Fiction" across every book.
-- Trade-off: reading a book may require a join-like population step to resolve the genre name, but this keeps the genre list consistent and makes updates easier when the genre catalog changes.
+For API clients that do not use cookies, middleware also accepts `Authorization: Bearer <token>`; the login endpoint intentionally issues the token as an httpOnly cookie.
 
-### Genre fields
+## Token Storage and Security Trade-off
 
-#### `name`
-- Stored as a plain string with a unique constraint.
-- The genre name is the display label shown in the UI and is a simple lookup value.
-- It is not embedded into each book because it is shared across many books and should be managed in one authoritative collection.
+This API stores the JWT in a browser **httpOnly cookie**, rather than localStorage. After a successful login, the server sets a cookie named `token` with the `httpOnly` flag, `SameSite=Strict`, a one-hour lifetime, and the `Secure` flag in production. The browser automatically sends the cookie with matching requests, while frontend JavaScript cannot read its value. This reduces the chance that an injected script in a Cross-Site Scripting (XSS) attack can steal the token. The JWT contains the user's database ID as its subject and is signed with the server-only `JWT_SECRET`; protected requests verify the signature and reload the user from MongoDB so the current role is used.
 
-#### `slug`
-- Stored as a lowercase URL-safe string with a unique constraint.
-- It supports clean route generation such as `/genres/science-fiction` without repeated formatting logic in the application.
-- Keeping it as a separate field in the `Genre` collection is useful because the slug is a stable identifier for routes and should be consistent across all books that reference the genre.
+The trade-off is that cookies are sent automatically by browsers, which creates a Cross-Site Request Forgery (CSRF) concern. This project uses `SameSite=Strict` as a browser-level mitigation and the API should additionally enforce trusted origins/CSRF tokens if it is deployed in a cross-site frontend configuration. The `Secure` flag is enabled in production so the cookie is sent only over HTTPS. By comparison, localStorage is simple to use with bearer headers, but any JavaScript running on the page can read it, making token theft through XSS easier. An httpOnly cookie is therefore the selected option for this API, with stricter cookie and origin configuration required for deployment.
 
-## Summary
+Logout is client-side cookie invalidation: `POST /api/auth/logout` sends a matching expired cookie using `Set-Cookie`. This project does not maintain a server-side token blocklist, so a copied token remains valid until its one-hour expiry; the browser's own cookie is cleared immediately.
 
-This schema balances simplicity and maintainability: descriptive, per-book metadata stays embedded in the `Book` document, while shared catalog categories such as genres are normalized into a separate `Genre` collection. That makes the seed data easy to manage while still keeping reads fast and updates consistent.
+## Existing catalog schema
+
+Book metadata is stored in the `Book` collection. Genre names and slugs are normalized in the `Genre` collection and referenced by ObjectId from each book.
